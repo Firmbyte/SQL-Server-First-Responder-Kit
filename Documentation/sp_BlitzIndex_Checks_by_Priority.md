@@ -6,8 +6,8 @@ Before adding a new check, make sure to add a Github issue for it first, and hav
 
 If you want to change anything about a check - the priority, finding, URL, or ID - open a Github issue first. The relevant scripts have to be updated too.
 
-CURRENT HIGH CHECKID: 127
-If you want to add a new check, start at 128.
+CURRENT HIGH CHECKID: 130
+If you want to add a new check, start at 131.
 
 | Priority | FindingsGroup           | Finding                                                         | URL                                                                                            | CheckID |
 | -------- | ----------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ------- |
@@ -36,6 +36,8 @@ If you want to add a new check, start at 128.
 | 100      | Indexes Worth Reviewing | Low Fill Factor on Nonclustered Index                           | https://www.brentozar.com/go/SelfLoathing                                                      | 40      |
 | 100      | Indexes Worth Reviewing | Medium Active Heap                                              | https://www.brentozar.com/go/SelfLoathing                                                      | 45      |
 | 100      | Indexes Worth Reviewing | Small Active Heap                                               | https://www.brentozar.com/go/SelfLoathing                                                      | 46      |
+| 100      | Indexes Worth Reviewing | Heap with PAGE compression                                      | https://vladdba.com/PageCompressedHeaps                                                        | 128     |
+| 100      | Indexes Worth Reviewing | Columnstore Index Needs to Be Rebuilt                           | https://learn.microsoft.com/en-us/sql/relational-databases/indexes/columnstore-indexes-what-s-new?view=sql-server-ver17 | 130     |
 | 100      | Forced Serialization    | Computed Column with Scalar UDF                                 | https://www.brentozar.com/go/serialudf                                                         | 99      |
 | 100      | Forced Serialization    | Check Constraint with Scalar UDF                                | https://www.brentozar.com/go/computedscalar                                                    | 94      |
 | 150      | Abnormal Design Pattern | Cascading Updates or Deletes                                    | https://www.brentozar.com/go/AbnormalPsychology                                                | 71      |
@@ -46,6 +48,7 @@ If you want to add a new check, start at 128.
 | 150      | Abnormal Design Pattern | In-Memory OLTP                                                  | https://www.brentozar.com/go/AbnormalPsychology                                                | 73      |
 | 150      | Abnormal Design Pattern | Non-Aligned Index on a Partitioned Table                        | https://www.brentozar.com/go/AbnormalPsychology                                                | 65      |
 | 150      | Abnormal Design Pattern | Partitioned Index                                               | https://www.brentozar.com/go/AbnormalPsychology                                                | 64      |
+| 150      | Abnormal Design Pattern | JSON Index                                                      | https://www.brentozar.com/go/AbnormalPsychology                                                | 129     |
 | 150      | Abnormal Design Pattern | Spatial Index                                                   | https://www.brentozar.com/go/AbnormalPsychology                                                | 62      |
 | 150      | Abnormal Design Pattern | XML Index                                                       | https://www.brentozar.com/go/AbnormalPsychology                                                | 60      |
 | 150      | Over-Indexing           | Approximate: Wide Indexes (7 or More Columns)                   | https://www.brentozar.com/go/IndexHoarder                                                      | 23      |
@@ -70,8 +73,8 @@ If you want to add a new check, start at 128.
 | 200      | Indexes Worth Reviewing | Heaps with Deletes                                              | https://www.brentozar.com/go/SelfLoathing                                                      | 49      |
 | 200      | High Workloads          | Scan-a-lots (index-usage-stats)                                 | https://www.brentozar.com/go/Workaholics                                                       | 80      |
 | 200      | High Workloads          | Top Recent Accesses (index-op-stats)                            | https://www.brentozar.com/go/Workaholics                                                       | 81      |
+| 200      | Specialized Indexes     | Optimized For Sequential Keys                                   | https://erikdarling.com/enabling-optimize-for-sequential-key/                                  | 121     |
 | 250      | Omitted Index Features  | Few Indexes Use Includes                                        | https://www.brentozar.com/go/IndexFeatures                                                     | 31      |
 | 250      | Omitted Index Features  | No Filtered Indexes or Indexed Views                            | https://www.brentozar.com/go/IndexFeatures                                                     | 32      |
 | 250      | Omitted Index Features  | No Indexes Use Includes                                         | https://www.brentozar.com/go/IndexFeatures                                                     | 30      |
 | 250      | Omitted Index Features  | Potential Filtered Index (Based on Column Name)                 | https://www.brentozar.com/go/IndexFeatures                                                     | 33      |
-| 250      | Specialized Indexes     | Optimized For Sequential Keys                                   |                                                                                                | 121     |

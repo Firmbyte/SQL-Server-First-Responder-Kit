@@ -34,10 +34,11 @@ ALTER PROCEDURE [dbo].[sp_BlitzAnalysis] (
 @Debug BIT = 0
 )
 AS 
+BEGIN
 SET NOCOUNT ON;
 SET STATISTICS XML OFF;
 
-SELECT @Version = '8.28', @VersionDate = '20251124';
+SELECT @Version = '8.34', @VersionDate = '20260702';
 
 IF(@VersionCheckMode = 1)
 BEGIN
@@ -49,7 +50,7 @@ BEGIN
 	PRINT 'EXEC sp_BlitzAnalysis 
 @StartDate = NULL,		/* Specify a datetime or NULL will get an hour ago */
 @EndDate = NULL,		/* Specify a datetime or NULL will get an hour of data since @StartDate */
-@OutputDatabaseName = N''DBA'',		/* Specify the database name where where we can find your logged blitz data */
+@OutputDatabaseName = N''DBA'',		/* Specify the database name where we can find your logged blitz data */
 @OutputSchemaName = N''dbo'',		/* Specify the schema */
 @OutputTableNameBlitzFirst = N''BlitzFirst'',		/* Table name where you are storing sp_BlitzFirst output, Set to NULL to ignore */ 
 @OutputTableNameFileStats = N''BlitzFirst_FileStats'',		/* Table name where you are storing sp_BlitzFirst filestats output, Set to NULL to ignore */ 
@@ -173,7 +174,7 @@ BEGIN
 	/* Default to an hour of data or SYSDATETIMEOFFSET() if now is earlier than the hour added to @StartDate */
 	IF(DATEADD(HOUR,1,@StartDate) < SYSDATETIMEOFFSET())
 	BEGIN 
-		RAISERROR('@EndDate was NULL - Setting to return 1 hour of information, if you want more then set @EndDate aswell',0,0) WITH NOWAIT;
+		RAISERROR('@EndDate was NULL - Setting to return 1 hour of information, if you want more then set @EndDate as well',0,0) WITH NOWAIT;
 		SET @EndDate = DATEADD(HOUR,1,@StartDate);
 	END
 	ELSE 
@@ -492,7 +493,7 @@ END
 /* Blitz cache data */
 RAISERROR('Sortorder for BlitzCache data: %s',0,0,@BlitzCacheSortorder) WITH NOWAIT;
 
-/* Set intial CTE */
+/* Set initial CTE */
 SET @Sql = N'WITH CheckDates AS (
 SELECT DISTINCT CheckDate 
 FROM '
@@ -888,4 +889,5 @@ BEGIN
 END
 
 
+END
 GO

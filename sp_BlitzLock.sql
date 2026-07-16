@@ -32,7 +32,8 @@ ALTER PROCEDURE
     @OutputDatabaseName sysname = NULL,
     @OutputSchemaName sysname = N'dbo',      /*ditto as below*/
     @OutputTableName sysname = N'BlitzLock', /*put a standard here no need to check later in the script*/
-    @ExportToExcel bit = 0
+    @ExportToExcel bit = 0,
+    @SkipExecutionPlans bit = 0 /*skip the execution plans result set (still returns deadlocks + findings rollup)*/
 )
 WITH RECOMPILE
 AS
@@ -42,7 +43,7 @@ BEGIN
     SET XACT_ABORT OFF;
     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
-    SELECT @Version = '8.28', @VersionDate = '20251124';
+    SELECT @Version = '8.34', @VersionDate = '20260702';
 
     IF @VersionCheckMode = 1
     BEGIN
@@ -90,7 +91,7 @@ BEGIN
 
         @OutputSchemaName: Specify a schema name to output information to a specific Schema
 
-        @OutputTableName: Specify table name to to output information to a specific table
+        @OutputTableName: Specify table name to output information to a specific table
 
         /*Point at a table containing deadlock XML*/
         @TargetDatabaseName: The database that contains the table with deadlock report XML
@@ -103,7 +104,10 @@ BEGIN
        
         @TargetTimestampColumnName: The name of the datetime column for filtering by date range (optional)
 
-   
+        /*Output options*/
+        @SkipExecutionPlans: Set to 1 to skip the execution plans result set and return only the findings rollup
+
+
     To learn more, visit http://FirstResponderKit.org where you can download new
     versions for free, watch training videos on how it works, get more info on
     the findings, contribute your own code, and more.
@@ -151,7 +155,7 @@ BEGIN
             DB_ID(@DatabaseName),
         @ProductVersion nvarchar(128) =
             CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)),
-        @ProductVersionMajor float =
+        @ProductVersionMajor decimal(5,1) =
             SUBSTRING
             (
                 CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)),
@@ -205,14 +209,18 @@ BEGIN
                 THEN 0
                 ELSE 1
             END,
+        @CanReadMSDB bit = 
+            (
+              SELECT COUNT(1) 
+              FROM fn_my_permissions(N'msdb.dbo.sysjobsteps', N'OBJECT') AS fmp 
+              WHERE fmp.permission_name = N'SELECT'
+            ),
         @d varchar(40) = '',
         @StringToExecute nvarchar(4000) = N'',
         @StringToExecuteParams nvarchar(500) = N'',
         @r sysname = NULL,
         @OutputTableFindings nvarchar(100) = N'[BlitzLockFindings]',
-        @DeadlockCount int = 0,
-        @ServerName sysname = @@SERVERNAME,
-        @OutputDatabaseCheck bit = -1,
+        @OutputDatabaseCheck bit = 1,
         @SessionId int = 0,
         @TargetSessionId int = 0,
         @FileName nvarchar(4000) = N'',
@@ -338,6 +346,12 @@ BEGIN
     SELECT
         @StartDateUTC = @StartDate,
         @EndDateUTC = @EndDate;
+
+    IF @StartDate > @EndDate
+    BEGIN
+        RAISERROR('@StartDate cannot be after @EndDate.', 11, 1) WITH NOWAIT;
+        RETURN;
+    END;
 
     IF
     (
@@ -528,7 +542,7 @@ BEGIN
 
 
     IF @Azure = 0
-    AND LOWER(@TargetSessionType) <> N'table'
+    AND (@TargetSessionType IS NULL OR LOWER(@TargetSessionType) <> N'table')
     BEGIN
         IF NOT EXISTS
         (
@@ -547,7 +561,7 @@ BEGIN
     END;
 
     IF @Azure = 1
-    AND LOWER(@TargetSessionType) <> N'table'
+    AND (@TargetSessionType IS NULL OR LOWER(@TargetSessionType) <> N'table')
     BEGIN
         IF NOT EXISTS
         (
@@ -560,8 +574,38 @@ BEGIN
             AND   dxs.create_time IS NOT NULL
         )
         BEGIN
-            RAISERROR('A session with the name %s does not exist or is not currently active.', 11, 1, @EventSessionName) WITH NOWAIT;
-            RETURN;
+            IF @EventSessionName = N'system_health'
+            AND NOT EXISTS
+            (
+                SELECT
+                    1/0
+                FROM sys.database_event_sessions AS ses
+                WHERE ses.name = @EventSessionName
+            )
+            BEGIN
+                RAISERROR('
+The system_health extended events session is not available in Azure SQL DB.
+
+To use sp_BlitzLock in Azure SQL DB, you have two options:
+
+1. Create a database-scoped deadlock XE session, e.g.:
+
+   CREATE EVENT SESSION [deadlocks] ON DATABASE
+   ADD EVENT sqlserver.database_xml_deadlock_report
+   ADD TARGET package0.ring_buffer;
+   ALTER EVENT SESSION [deadlocks] ON DATABASE STATE = START;
+
+   Then call: EXEC sp_BlitzLock @EventSessionName = N''deadlocks'', @TargetSessionType = N''ring_buffer'';
+
+2. Log deadlock XML to a table and use the @TargetTableName parameter.
+', 0, 1) WITH NOWAIT;
+                RETURN;
+            END;
+            ELSE
+            BEGIN
+                RAISERROR('A session with the name %s does not exist or is not currently active.', 11, 1, @EventSessionName) WITH NOWAIT;
+                RETURN;
+            END;
         END;
     END;
 
@@ -579,7 +623,7 @@ BEGIN
         ) /*If database is invalid raiserror and set bitcheck*/
         BEGIN
             RAISERROR('Database Name (%s) for output of table is invalid please, Output to Table will not be performed', 0, 1, @OutputDatabaseName) WITH NOWAIT;
-            SET @OutputDatabaseCheck = -1; /* -1 invalid/false, 0 = good/true */
+            SET @OutputDatabaseCheck = NULL; /* bit can't hold -1; NULL = invalid, 0 = valid, default 1 = no output db requested. See issue #4000. */
         END;
         ELSE
         BEGIN
@@ -588,18 +632,22 @@ BEGIN
             SELECT
                 @StringToExecute =
                     N'SELECT @r = o.name FROM ' +
-                    @OutputDatabaseName +
+                    QUOTENAME(@OutputDatabaseName) +
                     N'.sys.objects AS o inner join ' +
-                    @OutputDatabaseName +
+                    QUOTENAME(@OutputDatabaseName) +
                     N'.sys.schemas as s on o.schema_id = s.schema_id WHERE o.type_desc = N''USER_TABLE'' AND o.name = ' +
                     QUOTENAME
                     (
                         @OutputTableName,
                         N''''
                     ) +
-                    N' AND s.name =''' +
-                    @OutputSchemaName +
-                    N''';',
+                    N' AND s.name = ' +
+                    QUOTENAME
+                    (
+                        @OutputSchemaName,
+                        N''''
+                    ) +
+                    N';',
                 @StringToExecuteParams =
                     N'@r sysname OUTPUT';
 
@@ -670,7 +718,7 @@ BEGIN
                         N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
                         @ObjectFullName +
                         N''')) AND o.name = N''client_option_1'')
-                        /*Add wait_resource column*/
+                        /*Add client_option_1 column*/
                         ALTER TABLE ' +
                         @ObjectFullName +
                         N' ADD client_option_1 varchar(500) NULL;';
@@ -686,7 +734,7 @@ BEGIN
                         N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
                         @ObjectFullName +
                         N''')) AND o.name = N''client_option_2'')
-                        /*Add wait_resource column*/
+                        /*Add client_option_2 column*/
                         ALTER TABLE ' +
                         @ObjectFullName +
                         N' ADD client_option_2 varchar(500) NULL;';
@@ -702,7 +750,7 @@ BEGIN
                         N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
                         @ObjectFullName +
                         N''')) AND o.name = N''lock_mode'')
-                        /*Add wait_resource column*/
+                        /*Add lock_mode column*/
                         ALTER TABLE ' +
                         @ObjectFullName +
                         N' ADD lock_mode nvarchar(256) NULL;';
@@ -718,7 +766,7 @@ BEGIN
                         N'.sys.all_columns AS o WHERE o.object_id = (OBJECT_ID(''' +
                         @ObjectFullName +
                         N''')) AND o.name = N''status'')
-                        /*Add wait_resource column*/
+                        /*Add status column*/
                         ALTER TABLE ' +
                         @ObjectFullName +
                         N' ADD status nvarchar(256) NULL;';
@@ -784,50 +832,65 @@ BEGIN
                 IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
                 EXECUTE sys.sp_executesql
                     @StringToExecute;
+            END;
 
-                /*table created.*/
+            /*
+            Check for BlitzLockFindings table - runs regardless of whether main table existed
+            This was moved outside the ELSE block to fix issue where pre-existing deadlocks
+            table would skip BlitzLockFindings creation, causing synonym errors
+            Must filter by schema to avoid finding table in wrong schema
+            Note: @OutputSchemaName is already QUOTENAMEd at this point, so use PARSENAME to get raw name
+            */
+            SET @r = NULL; /*Reset - SELECT with no rows doesn't overwrite variable*/
+
+			SELECT
+                @StringToExecute =
+                    N'SELECT @r = o.name FROM ' +
+                    @OutputDatabaseName +
+                    N'.sys.objects AS o
+                    INNER JOIN ' +
+                    @OutputDatabaseName +
+                    N'.sys.schemas AS s
+                      ON o.schema_id = s.schema_id
+                    WHERE o.type_desc = N''USER_TABLE''
+                    AND o.name = N''BlitzLockFindings''
+                    AND s.name = N''' +
+                    PARSENAME(@OutputSchemaName, 1) +
+                    N'''',
+                @StringToExecuteParams =
+                    N'@r sysname OUTPUT';
+
+            IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
+            EXECUTE sys.sp_executesql
+                @StringToExecute,
+                @StringToExecuteParams,
+                @r OUTPUT;
+
+            IF (@r IS NULL) /*if table does not exist*/
+            BEGIN
                 SELECT
+                    @OutputTableFindings =
+                        QUOTENAME(N'BlitzLockFindings'),
                     @StringToExecute =
-                        N'SELECT @r = o.name FROM ' +
+                        N'USE ' +
                         @OutputDatabaseName +
-                        N'.sys.objects AS o
-                          WHERE o.type_desc = N''USER_TABLE''
-                          AND o.name = N''BlitzLockFindings''',
-                    @StringToExecuteParams =
-                        N'@r sysname OUTPUT';
+                        N';
+                        CREATE TABLE ' +
+                        @OutputSchemaName +
+                        N'.' +
+                        @OutputTableFindings +
+                        N' (
+                               ServerName nvarchar(256),
+                               check_id INT,
+                               database_name nvarchar(256),
+                               object_name nvarchar(1000),
+                               finding_group nvarchar(100),
+                               finding nvarchar(4000)
+                           );';
 
                 IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
                 EXECUTE sys.sp_executesql
-                    @StringToExecute,
-                    @StringToExecuteParams,
-                    @r OUTPUT;
-
-                IF (@r IS NULL) /*if table does not exist*/
-                BEGIN
-                    SELECT
-                        @OutputTableFindings =
-                            QUOTENAME(N'BlitzLockFindings'),
-                        @StringToExecute =
-                            N'USE ' +
-                            @OutputDatabaseName +
-                            N';
-                            CREATE TABLE ' +
-                            @OutputSchemaName +
-                            N'.' +
-                            @OutputTableFindings +
-                            N' (
-                                   ServerName nvarchar(256),
-                                   check_id INT,
-                                   database_name nvarchar(256),
-                                   object_name nvarchar(1000),
-                                   finding_group nvarchar(100),
-                                   finding nvarchar(4000)
-                               );';
-
-                    IF @Debug = 1 BEGIN PRINT @StringToExecute; END;
-                    EXECUTE sys.sp_executesql
-                        @StringToExecute;
-                END;
+                    @StringToExecute;
             END;
 
             /*create synonym for deadlockfindings.*/
@@ -836,7 +899,10 @@ BEGIN
                 SELECT
                     1/0
                 FROM sys.objects AS o
+                JOIN sys.schemas AS s
+                  ON o.schema_id = s.schema_id
                 WHERE o.name = N'DeadlockFindings'
+                AND   s.name = N'dbo'
                 AND   o.type_desc = N'SYNONYM'
             )
             BEGIN
@@ -863,7 +929,10 @@ BEGIN
                 SELECT
                     1/0
                 FROM sys.objects AS o
+                JOIN sys.schemas AS s
+                  ON o.schema_id = s.schema_id
                 WHERE o.name = N'DeadLockTbl'
+                AND   s.name = N'dbo'
                 AND   o.type_desc = N'SYNONYM'
             )
             BEGIN
@@ -978,7 +1047,7 @@ BEGIN
     /*If ring buffers*/
     IF
     (
-           @TargetSessionType LIKE N'ring%'
+           LOWER(@TargetSessionType) LIKE N'ring%'
        AND @EventSessionName NOT LIKE N'system_health%'
     )
     BEGIN
@@ -1033,7 +1102,7 @@ BEGIN
     /*If event file*/
     IF
     (
-           @TargetSessionType LIKE N'event%'
+           LOWER(@TargetSessionType) LIKE N'event%'
        AND @EventSessionName NOT LIKE N'system_health%'
     )
     BEGIN
@@ -1078,13 +1147,13 @@ BEGIN
             RAISERROR('@TargetSessionType is event_file, assigning XML for Azure', 0, 1) WITH NOWAIT;
             SELECT
                 @SessionId =
-                    t.event_session_address,
+                    t.event_session_id,
                 @TargetSessionId =
-                    t.target_name
-            FROM sys.dm_xe_database_session_targets t
-            JOIN sys.dm_xe_database_sessions s
-              ON s.address = t.event_session_address
-            WHERE t.target_name = @TargetSessionType
+                    t.target_id
+            FROM sys.database_event_session_targets AS t
+            JOIN sys.database_event_sessions AS s
+              ON s.event_session_id = t.event_session_id
+            WHERE t.name = @TargetSessionType
             AND   s.name = @EventSessionName
             OPTION(RECOMPILE);
 
@@ -1102,7 +1171,7 @@ BEGIN
                 SELECT
                     file_name =
                         CONVERT(nvarchar(4000), f.value)
-                FROM sys.server_event_session_fields AS f
+                FROM sys.database_event_session_fields AS f
                 WHERE f.event_session_id = @SessionId
                 AND   f.object_id = @TargetSessionId
                 AND   f.name = N'filename'
@@ -1134,7 +1203,7 @@ BEGIN
     /*If ring buffers*/
     IF
     (
-           @TargetSessionType LIKE N'ring%'
+           LOWER(@TargetSessionType) LIKE N'ring%'
        AND @EventSessionName NOT LIKE N'system_health%'
     )
     BEGIN
@@ -1169,7 +1238,7 @@ BEGIN
     /*If event file*/
     IF
     (
-           @TargetSessionType LIKE N'event_file%'
+           LOWER(@TargetSessionType) LIKE N'event_file%'
        AND @EventSessionName NOT LIKE N'system_health%'
     )
     BEGIN
@@ -1208,7 +1277,7 @@ BEGIN
     /*This section deals with event file*/
     IF
     (
-           @TargetSessionType LIKE N'event%'
+           LOWER(@TargetSessionType) LIKE N'event%'
        AND @EventSessionName LIKE N'system_health%'
     )
     BEGIN
@@ -1298,6 +1367,21 @@ BEGIN
            @xe OUTPUT,
            @xd OUTPUT;
 
+		/*This is a reasonable question to ask.*/
+		IF  @xe IS NULL
+		AND @xd IS NULL
+		BEGIN
+		    RAISERROR
+			(
+			    'No rows found in %s.%s.%s. Try again later.',
+				11,
+				1,
+				@TargetDatabaseName,
+				@TargetSchemaName,
+				@TargetTableName
+		    ) WITH NOWAIT;
+			RETURN;
+		END;
 
         /* Build dynamic SQL to extract the XML  */  
         IF  @xe = 1
@@ -1585,7 +1669,9 @@ BEGIN
             dp.id,
             dp.event_date,
             proc_name = ca.dp.value('@procname', 'nvarchar(1024)'),
-            sql_handle = ca.dp.value('@sqlhandle', 'nvarchar(131)')
+            sql_handle = ca.dp.value('@sqlhandle', 'nvarchar(131)'),
+            stmtstart = ca.dp.value('@stmtstart', 'int'),
+            stmtend = ca.dp.value('@stmtend', 'int')
         INTO #deadlock_stack
         FROM #deadlock_process AS dp
         CROSS APPLY dp.process_xml.nodes('//executionStack/frame') AS ca(dp)
@@ -1975,16 +2061,15 @@ BEGIN
         ADD
             waiter_mode nvarchar(256),
             owner_mode nvarchar(256),
-            is_victim AS
-                CONVERT
-                (
-                    bit,
-                    CASE
-                        WHEN id = victim_id
-                        THEN 1
-                        ELSE 0
-                    END
-                ) PERSISTED;
+            is_victim bit NOT NULL DEFAULT 0;
+
+        UPDATE
+            dp
+        SET
+            dp.is_victim = 1
+        FROM #deadlock_process AS dp
+        WHERE dp.deadlock_graph.exist('deadlock/victim-list/victimProcess[@id = sql:column("dp.id")]') = 1
+        OPTION(RECOMPILE);
 
         /*Update some nonsense*/
         SET @d = CONVERT(varchar(40), GETDATE(), 109);
@@ -2088,6 +2173,7 @@ BEGIN
         (
                 @Azure = 0
             AND @RDS = 0
+            AND @CanReadMSDB = 1
         )
         BEGIN
             SET @StringToExecute =
@@ -2316,21 +2402,24 @@ BEGIN
                 OVER (ORDER BY COUNT_BIG(DISTINCT dow.event_date) DESC)
         FROM #deadlock_owner_waiter AS dow
         WHERE 1 = 1
-        AND dow.lock_mode IN
-            (
-                N'S',
-                N'IS'
-            )
-        OR  dow.owner_mode IN
-            (
-                N'S',
-                N'IS'
-            )
-        OR  dow.waiter_mode IN
-            (
-                N'S',
-                N'IS'
-            )
+        AND
+        (
+            dow.lock_mode IN
+                (
+                    N'S',
+                    N'IS'
+                )
+            OR  dow.owner_mode IN
+                (
+                    N'S',
+                    N'IS'
+                )
+            OR  dow.waiter_mode IN
+                (
+                    N'S',
+                    N'IS'
+                )
+        )
         AND (dow.database_id = @DatabaseId OR @DatabaseName IS NULL)
         AND (dow.event_date >= @StartDate OR @StartDate IS NULL)
         AND (dow.event_date < @EndDate OR @EndDate IS NULL)
@@ -2717,7 +2806,7 @@ BEGIN
 
         RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
-        /*Check 8 gives you more info queries for sp_BlitzCache & BlitzQueryStore*/
+        /*Check 8 gives you more info queries for sp_BlitzCache & sp_QuickieStore*/
         SET @d = CONVERT(varchar(40), GETDATE(), 109);
         RAISERROR('Check 8 more info part 1 BlitzCache %s', 0, 1, @d) WITH NOWAIT;
 
@@ -2802,7 +2891,7 @@ BEGIN
         IF (@ProductVersionMajor >= 13 OR @Azure = 1)
         BEGIN
             SET @d = CONVERT(varchar(40), GETDATE(), 109);
-            RAISERROR('Check 8 more info part 2 BlitzQueryStore %s', 0, 1, @d) WITH NOWAIT;
+            RAISERROR('Check 8 more info part 2 sp_QuickieStore %s', 0, 1, @d) WITH NOWAIT;
 
             WITH
                 deadlock_stack AS
@@ -2834,12 +2923,24 @@ BEGIN
                 dow.database_name,
                 object_name = ds.proc_name,
                 finding_group = N'More Info - Query',
+                /* sp_QuickieStore is Erik Darling's Query Store explorer; install it
+                   from https://erikdarling.com/sp_quickiestore/ if you don't already
+                   have it. sp_BlitzQueryStore (the prior FRK tool that lived here) is
+                   deprecated.
+
+                   Pull @database_name from dow.database_name (derived from
+                   dow.database_id at deadlock time) rather than ds.database_name
+                   (PARSENAME(ds.proc_name, 3)). PARSENAME returns NULL for any
+                   proc_name that isn't 3-part, and QUOTENAME(NULL, '''') would
+                   NULL out the whole finding via string concat. dow.database_name
+                   is already used 4 lines up for the output column, so this stays
+                   consistent. */
                 finding =
-                    N'EXECUTE sp_BlitzQueryStore ' +
-                    N'@DatabaseName = ' +
-                    QUOTENAME(ds.database_name, N'''') +
+                    N'EXECUTE sp_QuickieStore ' +
+                    N'@database_name = ' +
+                    QUOTENAME(dow.database_name, N'''') +
                     N', ' +
-                    N'@StoredProcName = ' +
+                    N'@procedure_name = ' +
                     QUOTENAME(ds.proc_only_name, N'''') +
                     N';'
             FROM deadlock_stack AS ds
@@ -3330,7 +3431,7 @@ BEGIN
             finding_group = N'Agent Job Deadlocks',
             finding =
                 N'There have been ' +
-                RTRIM(COUNT_BIG(DISTINCT aj.event_date)) +
+                CONVERT(nvarchar(20), COUNT_BIG(DISTINCT aj.event_date)) +
                 N' deadlocks from this Agent Job and Step.',
             sort_order = 
                 ROW_NUMBER()
@@ -3450,7 +3551,7 @@ BEGIN
             finding
         )
         SELECT
-            check_id = 14,
+            check_id = 16,
             database_name = N'-',
             object_name = N'-',
             finding_group = N'Total implicit transaction deadlocks',
@@ -3465,6 +3566,175 @@ BEGIN
         FROM #deadlock_process AS dp
         WHERE dp.transaction_name = N'implicit_transaction'
         HAVING COUNT_BIG(DISTINCT dp.event_date) > 0
+        OPTION(RECOMPILE);
+
+        RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
+
+        /*Check 17 is top deadlock queries by involvement*/
+        SET @d = CONVERT(varchar(40), GETDATE(), 109);
+        RAISERROR('Check 17 top deadlock queries %s', 0, 1, @d) WITH NOWAIT;
+
+        WITH
+            top_frame AS
+        (
+            SELECT
+                ds.id,
+                ds.event_date,
+                ds.proc_name,
+                ds.sql_handle,
+                ds.stmtstart,
+                ds.stmtend,
+                rn =
+                    ROW_NUMBER() OVER
+                    (
+                        PARTITION BY
+                            ds.id,
+                            ds.event_date
+                        ORDER BY
+                            ds.stmtstart
+                    )
+            FROM #deadlock_stack AS ds
+            WHERE ds.sql_handle <> N'0x'
+            AND   ds.sql_handle <> N''
+            AND   ds.sql_handle IS NOT NULL
+        ),
+            deadlock_queries AS
+        (
+            SELECT
+                dp.database_name,
+                tf.sql_handle,
+                tf.stmtstart,
+                tf.stmtend,
+                tf.proc_name,
+                dp.event_date,
+                dp.is_victim,
+                inputbuf =
+                    dp.process_xml.value
+                    (
+                        '(//process/inputbuf/text())[1]',
+                        'nvarchar(256)'
+                    )
+            FROM top_frame AS tf
+            JOIN #deadlock_process AS dp
+              ON dp.id = tf.id
+              AND dp.event_date = tf.event_date
+            WHERE tf.rn = 1
+            AND (dp.database_name = @DatabaseName OR @DatabaseName IS NULL)
+            AND (dp.event_date >= @StartDate OR @StartDate IS NULL)
+            AND (dp.event_date < @EndDate OR @EndDate IS NULL)
+            AND (dp.client_app = @AppName OR @AppName IS NULL)
+            AND (dp.host_name = @HostName OR @HostName IS NULL)
+            AND (dp.login_name = @LoginName OR @LoginName IS NULL)
+        )
+        INSERT
+            #deadlock_findings WITH(TABLOCKX)
+        (
+            check_id,
+            database_name,
+            object_name,
+            finding_group,
+            finding,
+            sort_order
+        )
+        SELECT
+            check_id = 17,
+            dq.database_name,
+            object_name =
+                LEFT
+                (
+                    REPLACE
+                    (
+                        REPLACE
+                        (
+                            CASE
+                                WHEN dq.proc_name <> N'adhoc'
+                                THEN dq.proc_name
+                                ELSE
+                                    ISNULL
+                                    (
+                                        MAX(dq.inputbuf),
+                                        N'[Unknown]'
+                                    )
+                            END,
+                            NCHAR(13),
+                            N' '
+                        ),
+                        NCHAR(10),
+                        N' '
+                    ),
+                    200
+                ),
+            finding_group = N'Top Deadlock Query',
+            finding =
+                N'This query was involved in ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dq.event_date)
+                ) +
+                N' deadlocks (victim ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    SUM
+                    (
+                        CONVERT(int, dq.is_victim)
+                    )
+                ) +
+                N' times, survived ' +
+                CONVERT
+                (
+                    nvarchar(20),
+                    COUNT_BIG(DISTINCT dq.event_date) -
+                    SUM
+                    (
+                        CONVERT(int, dq.is_victim)
+                    )
+                ) +
+                N' times), ' +
+                ISNULL
+                (
+                    CONVERT
+                    (
+                        nvarchar(10),
+                        CONVERT
+                        (
+                            decimal(5, 1),
+                            100.0 *
+                            COUNT_BIG(DISTINCT dq.event_date) /
+                            NULLIF
+                            (
+                                SUM
+                                (
+                                    COUNT_BIG(DISTINCT dq.event_date)
+                                ) OVER (),
+                                0
+                            )
+                        )
+                    ),
+                    N'0.0'
+                ) +
+                N'% of total.',
+            sort_order =
+                ROW_NUMBER() OVER
+                (
+                    ORDER BY
+                        COUNT_BIG(DISTINCT dq.event_date) DESC
+                )
+        FROM deadlock_queries AS dq
+        GROUP BY
+            dq.database_name,
+            dq.sql_handle,
+            dq.stmtstart,
+            dq.stmtend,
+            dq.proc_name
+        HAVING
+            COUNT_BIG(DISTINCT dq.event_date) * 10 >=
+            (
+                SELECT
+                    COUNT_BIG(DISTINCT dq2.event_date)
+                FROM deadlock_queries AS dq2
+            )
         OPTION(RECOMPILE);
 
         RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
@@ -3710,11 +3980,8 @@ BEGIN
                         d.en
                     ) +
                     N', Query #'
-                    + CASE
-                          WHEN d.qn = 0
-                          THEN N'1'
-                          ELSE CONVERT(nvarchar(10), d.qn)
-                      END + CASE
+                    + CONVERT(nvarchar(10), d.qn + 1)
+                      + CASE
                                 WHEN d.is_victim = 1
                                 THEN N' - VICTIM'
                                 ELSE N''
@@ -4010,6 +4277,7 @@ BEGIN
             FROM #deadlock_results AS dr
             ORDER BY
                 dr.event_date,
+                dr.deadlock_group,
                 dr.is_victim DESC
             OPTION(RECOMPILE, LOOP JOIN, HASH JOIN);
             ';
@@ -4131,20 +4399,30 @@ BEGIN
            
                 RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
 
+                /*
+                When @SkipExecutionPlans = 1, skip gathering and returning the
+                execution plans result set and jump straight to the findings rollup.
+                */
+                IF @SkipExecutionPlans = 1
+                BEGIN
+                    GOTO ReturnDeadlockFindings;
+                END;
+
                 SET @d = CONVERT(varchar(40), GETDATE(), 109);
                 RAISERROR('Getting available execution plans for deadlocks %s', 0, 1, @d) WITH NOWAIT;
-             
+
                 SELECT DISTINCT
                     available_plans =
                         'available_plans',
                     ds.proc_name,
                     sql_handle =
                         CONVERT(varbinary(64), ds.sql_handle, 1),
+                    ds.stmtstart,
+                    ds.stmtend,
                     dow.database_name,
                     dow.database_id,
-                    dow.object_name,
                     query_xml =
-                        TRY_CAST(dr.query_xml AS nvarchar(MAX))
+                        MAX(TRY_CAST(dr.query_xml AS nvarchar(MAX)))
                 INTO #available_plans
                 FROM #deadlock_stack AS ds
                 JOIN #deadlock_owner_waiter AS dow
@@ -4153,6 +4431,13 @@ BEGIN
                 JOIN #deadlock_results AS dr
                   ON  dr.id = ds.id
                   AND dr.event_date = ds.event_date
+                GROUP BY
+                    ds.proc_name,
+                    CONVERT(varbinary(64), ds.sql_handle, 1),
+                    ds.stmtstart,
+                    ds.stmtend,
+                    dow.database_name,
+                    dow.database_id
                 OPTION(RECOMPILE);
 
                 SELECT
@@ -4194,13 +4479,13 @@ BEGIN
                     total_logical_reads_mb =
                         deqs.total_logical_reads * 8. / 1024.,
                     min_grant_mb =
-                        deqs.min_grant_kb * 8. / 1024.,
+                        deqs.min_grant_kb / 1024.,
                     max_grant_mb =
-                        deqs.max_grant_kb * 8. / 1024.,
+                        deqs.max_grant_kb / 1024.,
                     min_used_grant_mb =
-                        deqs.min_used_grant_kb * 8. / 1024.,
+                        deqs.min_used_grant_kb / 1024.,
                     max_used_grant_mb =
-                        deqs.max_used_grant_kb * 8. / 1024.,  
+                        deqs.max_used_grant_kb / 1024.,  
                     deqs.min_reserved_threads,
                     deqs.max_reserved_threads,
                     deqs.min_used_threads,
@@ -4306,6 +4591,8 @@ BEGIN
                         ) AS deps
                         WHERE deqs.sql_handle = ap.sql_handle
                         AND   deps.dbid = ap.database_id
+                        AND   (ap.stmtstart IS NULL OR deqs.statement_start_offset = ap.stmtstart)
+                        AND   (ap.stmtend   IS NULL OR deqs.statement_end_offset = ap.stmtend)
                     ) AS c
                 ) AS ap
                 WHERE ap.query_plan IS NOT NULL
@@ -4314,10 +4601,12 @@ BEGIN
                 OPTION(RECOMPILE, LOOP JOIN, HASH JOIN);
 
                 RAISERROR('Finished at %s', 0, 1, @d) WITH NOWAIT;
-           
+
+                ReturnDeadlockFindings:
+
                 SET @d = CONVERT(varchar(40), GETDATE(), 109);
                 RAISERROR('Returning findings %s', 0, 1, @d) WITH NOWAIT;
-           
+
                 SELECT
                     df.check_id,
                     df.database_name,
@@ -4475,7 +4764,9 @@ BEGIN
             OutputTableName =
                 @OutputTableName,
             ExportToExcel =
-                @ExportToExcel;
+                @ExportToExcel,
+            SkipExecutionPlans =
+                @SkipExecutionPlans;
 
         SELECT
             declared_variables =
@@ -4508,10 +4799,6 @@ BEGIN
                 @r,
             OutputTableFindings =
                 @OutputTableFindings,
-            DeadlockCount =
-                @DeadlockCount,
-            ServerName =
-                @ServerName,
             OutputDatabaseCheck =
                 @OutputDatabaseCheck,
             SessionId =

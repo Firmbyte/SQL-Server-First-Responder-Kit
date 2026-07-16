@@ -24,14 +24,16 @@ AS
 	SET STATISTICS XML OFF;
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 	
-	SELECT @Version = '8.28', @VersionDate = '20251124';
+	SELECT @Version = '8.34', @VersionDate = '20260702';
 	
 	IF(@VersionCheckMode = 1)
 	BEGIN
 		RETURN;
 	END;
 
-	IF @Help = 1 PRINT '
+	IF @Help = 1
+    BEGIN
+        PRINT '
 	/*
 	sp_BlitzBackups from http://FirstResponderKit.org
 	
@@ -90,12 +92,178 @@ AS
 	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 	SOFTWARE.
-
-
-
-
 	*/';
-ELSE
+
+       /* Parameter descriptions */
+        SELECT N'@Help'                          AS [Parameter Name], N'TINYINT'        AS [Data Type], N'0'     AS [Default Value], N'Displays this help message.'                                                                                                          AS [Parameter Description]
+        UNION ALL
+        SELECT N'@HoursBack',                     N'INT',             N'168',            N'How many hours of backup history to examine, counting back from now. Default is 168 (7 days).'
+        UNION ALL
+        SELECT N'@MSDBName',                      N'NVARCHAR(256)',   N'''msdb''',       N'The database name to read backup history from. Useful when you restore msdb from other servers or consolidate history into a DBA utility database.'
+        UNION ALL
+        SELECT N'@AGName',                        N'NVARCHAR(256)',   N'NULL',           N'Availability group name. Used to resolve the listener when @WriteBackupsToListenerName is not provided.'
+        UNION ALL
+        SELECT N'@RestoreSpeedFullMBps',          N'INT',             N'NULL',           N'Override the estimated restore speed for full backups (MB/s). When NULL, the observed backup speed from msdb is used.'
+        UNION ALL
+        SELECT N'@RestoreSpeedDiffMBps',          N'INT',             N'NULL',           N'Override the estimated restore speed for differential backups (MB/s). When NULL, the observed backup speed from msdb is used.'
+        UNION ALL
+        SELECT N'@RestoreSpeedLogMBps',           N'INT',             N'NULL',           N'Override the estimated restore speed for log backups (MB/s). When NULL, the observed backup speed from msdb is used.'
+        UNION ALL
+        SELECT N'@Debug',                         N'TINYINT',         N'0',              N'When set to 1, prints dynamic SQL statements before executing them.'
+        UNION ALL
+        SELECT N'@PushBackupHistoryToListener',   N'BIT',             N'0',              N'When set to 1, pushes backup history to an AG listener instead of returning the normal result sets.'
+        UNION ALL
+        SELECT N'@WriteBackupsToListenerName',    N'NVARCHAR(256)',   N'NULL',           N'The linked server name of the AG listener to write backup history to. Required when @PushBackupHistoryToListener = 1.'
+        UNION ALL
+        SELECT N'@WriteBackupsToDatabaseName',    N'NVARCHAR(256)',   N'NULL',           N'The target database name on the listener to write backup history into. Required when @PushBackupHistoryToListener = 1.'
+        UNION ALL
+        SELECT N'@WriteBackupsLastHours',         N'INT',             N'168',            N'How many hours of backup history to push to the listener. Default is 168 (7 days).'
+        UNION ALL
+        SELECT N'@Version',                       N'VARCHAR(30)',     N'NULL OUTPUT',    N'Output parameter. Returns the version number of sp_BlitzBackups.'
+        UNION ALL
+        SELECT N'@VersionDate',                   N'DATETIME',        N'NULL OUTPUT',    N'Output parameter. Returns the release date of this version of sp_BlitzBackups.'
+        UNION ALL
+        SELECT N'@VersionCheckMode',              N'BIT',             N'0',              N'When set to 1, returns the version number and date, then exits.';
+
+        /* Result set 1: #Backups - RPO/RTO and backup speed/size statistics per database */
+        SELECT N'Result Set 1: Backup Statistics' AS [Result Set],
+               N'database_name'                              AS [Column Name],
+               N'NVARCHAR(128)'                              AS [Data Type],
+               N'Name of the database.'                      AS [Column Description]
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'database_guid',                     N'UNIQUEIDENTIFIER',  N'Unique identifier for the database, as recorded in msdb.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'RPOWorstCaseMinutes',               N'DECIMAL(18,1)',     N'Worst-case Recovery Point Objective in minutes: the largest observed gap between consecutive backups in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'RTOWorstCaseMinutes',               N'DECIMAL(18,1)',     N'Worst-case Recovery Time Objective in minutes: estimated time to restore the largest backup chain needed to recover.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'RPOWorstCaseBackupSetID',           N'INT',              N'Backup set ID of the backup at the end of the worst RPO gap.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'RPOWorstCaseBackupSetFinishTime',   N'DATETIME',         N'Finish time of the backup set at the end of the worst RPO gap.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'RPOWorstCaseBackupSetIDPrior',      N'INT',              N'Backup set ID of the backup immediately before the worst RPO gap.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'RPOWorstCaseBackupSetPriorFinishTime', N'DATETIME',      N'Finish time of the backup set immediately before the worst RPO gap.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'RPOWorstCaseMoreInfoQuery',         N'XML',              N'Clickable XML containing a query you can run to investigate the worst RPO gap further.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'RTOWorstCaseBackupFileSizeMB',      N'DECIMAL(18,2)',    N'Total size in MB of all backup files required for the worst-case restore (full + diff + logs).'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'RTOWorstCaseMoreInfoQuery',         N'XML',              N'Clickable XML containing a query you can run to investigate the worst RTO scenario further.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'FullMBpsAvg',                       N'DECIMAL(18,2)',    N'Average throughput in MB/s for full backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'FullMBpsMin',                       N'DECIMAL(18,2)',    N'Minimum throughput in MB/s for full backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'FullMBpsMax',                       N'DECIMAL(18,2)',    N'Maximum throughput in MB/s for full backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'FullSizeMBAvg',                     N'DECIMAL(18,2)',    N'Average uncompressed size in MB of full backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'FullSizeMBMin',                     N'DECIMAL(18,2)',    N'Minimum uncompressed size in MB of full backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'FullSizeMBMax',                     N'DECIMAL(18,2)',    N'Maximum uncompressed size in MB of full backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'FullCompressedSizeMBAvg',           N'DECIMAL(18,2)',    N'Average compressed size in MB of full backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'FullCompressedSizeMBMin',           N'DECIMAL(18,2)',    N'Minimum compressed size in MB of full backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'FullCompressedSizeMBMax',           N'DECIMAL(18,2)',    N'Maximum compressed size in MB of full backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'DiffMBpsAvg',                       N'DECIMAL(18,2)',    N'Average throughput in MB/s for differential backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'DiffMBpsMin',                       N'DECIMAL(18,2)',    N'Minimum throughput in MB/s for differential backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'DiffMBpsMax',                       N'DECIMAL(18,2)',    N'Maximum throughput in MB/s for differential backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'DiffSizeMBAvg',                     N'DECIMAL(18,2)',    N'Average uncompressed size in MB of differential backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'DiffSizeMBMin',                     N'DECIMAL(18,2)',    N'Minimum uncompressed size in MB of differential backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'DiffSizeMBMax',                     N'DECIMAL(18,2)',    N'Maximum uncompressed size in MB of differential backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'DiffCompressedSizeMBAvg',           N'DECIMAL(18,2)',    N'Average compressed size in MB of differential backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'DiffCompressedSizeMBMin',           N'DECIMAL(18,2)',    N'Minimum compressed size in MB of differential backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'DiffCompressedSizeMBMax',           N'DECIMAL(18,2)',    N'Maximum compressed size in MB of differential backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'LogMBpsAvg',                        N'DECIMAL(18,2)',    N'Average throughput in MB/s for log backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'LogMBpsMin',                        N'DECIMAL(18,2)',    N'Minimum throughput in MB/s for log backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'LogMBpsMax',                        N'DECIMAL(18,2)',    N'Maximum throughput in MB/s for log backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'LogSizeMBAvg',                      N'DECIMAL(18,2)',    N'Average uncompressed size in MB of log backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'LogSizeMBMin',                      N'DECIMAL(18,2)',    N'Minimum uncompressed size in MB of log backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'LogSizeMBMax',                      N'DECIMAL(18,2)',    N'Maximum uncompressed size in MB of log backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'LogCompressedSizeMBAvg',            N'DECIMAL(18,2)',    N'Average compressed size in MB of log backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'LogCompressedSizeMBMin',            N'DECIMAL(18,2)',    N'Minimum compressed size in MB of log backups taken in the time window.'
+        UNION ALL
+        SELECT N'Result Set 1: Backup Statistics', N'LogCompressedSizeMBMax',            N'DECIMAL(18,2)',    N'Maximum compressed size in MB of log backups taken in the time window.'
+        
+		/* Result set 2: #Recoverability + #Trending - recoverability details and 13-month size trend */
+		UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend' AS [Result Set],
+               N'DatabaseName'                                                             AS [Column Name],
+               N'NVARCHAR(128)'                                                            AS [Data Type],
+               N'Name of the database.'                                                    AS [Column Description]
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'DatabaseGUID',                  N'UNIQUEIDENTIFIER',  N'Unique identifier for the database, as recorded in msdb.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'LastBackupRecoveryModel',        N'NVARCHAR(60)',      N'Recovery model of the database at the time of its most recent backup.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'FirstFullBackupSizeMB',          N'DECIMAL(18,2)',     N'Uncompressed size in MB of the oldest full backup in the time window.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'FirstFullBackupDate',            N'DATETIME',         N'Date and time of the oldest full backup in the time window.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'LastFullBackupSizeMB',           N'DECIMAL(18,2)',     N'Uncompressed size in MB of the most recent full backup in the time window.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'LastFullBackupDate',             N'DATETIME',         N'Date and time of the most recent full backup in the time window.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'AvgFullBackupThroughputMB',      N'DECIMAL(18,2)',     N'Average backup throughput in MB/s for full backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'AvgFullBackupDurationSeconds',   N'INT',              N'Average duration in seconds for full backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'AvgDiffBackupThroughputMB',      N'DECIMAL(18,2)',     N'Average backup throughput in MB/s for differential backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'AvgDiffBackupDurationSeconds',   N'INT',              N'Average duration in seconds for differential backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'AvgLogBackupThroughputMB',       N'DECIMAL(18,2)',     N'Average backup throughput in MB/s for log backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'AvgLogBackupDurationSeconds',    N'INT',              N'Average duration in seconds for log backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'AvgFullSizeMB',                  N'DECIMAL(18,2)',     N'Average uncompressed size in MB of full backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'AvgDiffSizeMB',                  N'DECIMAL(18,2)',     N'Average uncompressed size in MB of differential backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'AvgLogSizeMB',                   N'DECIMAL(18,2)',     N'Average uncompressed size in MB of log backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'IsBigDiff',                      N'BIT (computed)',    N'1 when the average full backup exceeds 10 GB and average diff size is >= 40% of the full size. Consider taking more frequent diffs.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'IsBigLog',                       N'BIT (computed)',    N'1 when the average full backup exceeds 10 GB and average log size is >= 20% of the full size. Consider taking more frequent log backups.'
+        UNION ALL
+        SELECT N'Result Set 2: Recoverability and 13-month size trend', N'[0] through [-12]',              N'DECIMAL(18,2)',     N'Average full backup size in MB for each of the last 13 months relative to @StartTime. [0] = current month, [-1] = one month ago, etc. Only populated when @MSDBName = ''msdb''.'
+        /* Result set 3: #Warnings - rules analysis findings */
+		UNION ALL
+        SELECT N'Result Set 3: Warnings' AS [Result Set],
+               N'CheckId'                             AS [Column Name],
+               N'INT'                                 AS [Data Type],
+               N'Numeric identifier of the check that generated this warning.' AS [Column Description]
+        UNION ALL
+        SELECT N'Result Set 3: Warnings', N'Priority',     N'INT',           N'Lower numbers indicate more important findings.'
+        UNION ALL
+        SELECT N'Result Set 3: Warnings', N'DatabaseName', N'NVARCHAR(128)', N'Name of the database the warning applies to.'
+        UNION ALL
+        SELECT N'Result Set 3: Warnings', N'Finding',      N'VARCHAR(256)',  N'Short label describing the type of finding.'
+        UNION ALL
+        SELECT N'Result Set 3: Warnings', N'Warning',      N'VARCHAR(8000)', N'Detailed description of the finding and what to consider doing about it.';
+
+        RETURN;
+    END;
 BEGIN
 DECLARE @StringToExecute NVARCHAR(MAX) = N'', 
 		@InnerStringToExecute NVARCHAR(MAX) = N'',
@@ -912,7 +1080,7 @@ RAISERROR('Rules analysis starting', 0, 1) WITH NOWAIT;
 
 	SET @StringToExecute += N'SELECT 
 								4 AS CheckId,
-								100 AS [Priority],
+								200 AS [Priority],
 								b.database_name AS [Database Name],
 								''Snapshot backups'' AS [Finding],
 								''The database '' + QUOTENAME(b.database_name) + '' has had '' + CONVERT(VARCHAR(10), COUNT(*)) + '' snapshot backups. This message is purely informational.'' AS [Warning]
@@ -932,7 +1100,7 @@ RAISERROR('Rules analysis starting', 0, 1) WITH NOWAIT;
 
 	SET @StringToExecute += N'SELECT 
 								5 AS CheckId,
-								100 AS [Priority],
+								150 AS [Priority],
 								b.database_name AS [Database Name],
 								''Read only state backups'' AS [Finding],
 								''The database '' + QUOTENAME(b.database_name) + '' has been backed up '' + CONVERT(VARCHAR(10), COUNT(*)) + '' times while in a read-only state. This can be normal if it''''s a secondary, but a bit odd otherwise.'' AS [Warning]
@@ -952,7 +1120,7 @@ RAISERROR('Rules analysis starting', 0, 1) WITH NOWAIT;
 
 	SET @StringToExecute += N'SELECT 
 								6 AS CheckId,
-								100 AS [Priority],
+								50 AS [Priority],
 								b.database_name AS [Database Name],
 								''Single user mode backups'' AS [Finding],
 								''The database '' + QUOTENAME(b.database_name) + '' has been backed up '' + CONVERT(VARCHAR(10), COUNT(*)) + '' times while in single-user mode. This is really weird! Make sure your backup process doesn''''t include a mode change anywhere.'' AS [Warning]
@@ -972,28 +1140,28 @@ RAISERROR('Rules analysis starting', 0, 1) WITH NOWAIT;
 
 	SET @StringToExecute += N'SELECT 
 								7 AS CheckId,
-								100 AS [Priority],
+								20 AS [Priority],
 								b.database_name AS [Database Name],
 								''No CHECKSUMS'' AS [Finding],
-								''The database '' + QUOTENAME(b.database_name) + '' has been backed up '' + CONVERT(VARCHAR(10), COUNT(*)) + '' times without CHECKSUMS in the past 30 days. CHECKSUMS can help alert you to corruption errors.'' AS [Warning]
+								''The database '' + QUOTENAME(b.database_name) + '' has been backed up '' + CONVERT(VARCHAR(10), COUNT(*)) + '' times without CHECKSUMS. CHECKSUMS can help alert you to corruption errors.'' AS [Warning]
 							FROM   ' + QUOTENAME(@MSDBName) + N'.dbo.backupset AS b
 							WHERE b.has_backup_checksums = 0
-							AND b.backup_finish_date >= DATEADD(DAY, -30, SYSDATETIME())
+							AND b.backup_finish_date >= @StartTime
 							GROUP BY b.database_name;' + @crlf;
 
 	IF @Debug = 1
 		PRINT @StringToExecute;
 
 		INSERT #Warnings ( CheckId, Priority, DatabaseName, Finding, Warning )
-		EXEC sys.sp_executesql @StringToExecute;
-	
+		EXEC sys.sp_executesql @StringToExecute, N'@StartTime DATETIME2', @StartTime;
+
 	/*Damaged is a Black Flag album. You don''t want your backups to be like a Black Flag album. */
 
 	SET @StringToExecute = N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;' + @crlf;
 
 	SET @StringToExecute += N'SELECT 
 								8 AS CheckId,
-								100 AS [Priority],
+								10 AS [Priority],
 								b.database_name AS [Database Name],
 								''Damaged backups'' AS [Finding],
 								''The database '' + QUOTENAME(b.database_name) + '' has had '' + CONVERT(VARCHAR(10), COUNT(*)) + '' damaged backups taken without stopping to throw an error. This is done by specifying CONTINUE_AFTER_ERROR in your BACKUP commands.'' AS [Warning]
@@ -1063,16 +1231,21 @@ IF @ProductVersionMajor >= 12
 
 	SET @StringToExecute =N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;' + @crlf;
 
-	SET @StringToExecute += N'SELECT 
+	SET @StringToExecute += N';WITH RecoveryHistory AS (
+		SELECT b.database_name, b.recovery_model,
+			LAG(b.recovery_model) OVER (PARTITION BY b.database_name ORDER BY b.backup_finish_date, b.backup_set_id) AS prev_recovery_model
+		FROM ' + QUOTENAME(@MSDBName) + '.dbo.backupset AS b
+		WHERE b.recovery_model <> ''BULK-LOGGED''
+	)
+	SELECT
 		11 AS CheckId,
-		100 AS [Priority],
-		b.database_name AS [Database Name],
+		10 AS [Priority],
+		database_name AS [Database Name],
 		''Recovery model switched'' AS [Finding],
-		''The database '' + QUOTENAME(b.database_name) + '' has changed recovery models from between FULL and SIMPLE '' + CONVERT(VARCHAR(10), COUNT(DISTINCT b.recovery_model)) + '' times. This breaks the log chain and is generally a bad idea.'' AS [Warning]
-	FROM   ' + QUOTENAME(@MSDBName) + '.dbo.backupset AS b
-	WHERE b.recovery_model <> ''BULK-LOGGED''
-	GROUP BY b.database_name
-	HAVING COUNT(DISTINCT b.recovery_model) > 4;' + @crlf;
+		''The database '' + QUOTENAME(database_name) + '' has switched between the FULL and SIMPLE recovery models '' + CONVERT(VARCHAR(10), SUM(CASE WHEN prev_recovery_model IS NOT NULL AND recovery_model <> prev_recovery_model THEN 1 ELSE 0 END)) + '' times. This breaks the log chain and is generally a bad idea.'' AS [Warning]
+	FROM RecoveryHistory
+	GROUP BY database_name
+	HAVING SUM(CASE WHEN prev_recovery_model IS NOT NULL AND recovery_model <> prev_recovery_model THEN 1 ELSE 0 END) > 0;' + @crlf;
 
 	IF @Debug = 1
 		PRINT @StringToExecute;
@@ -1086,40 +1259,76 @@ IF @ProductVersionMajor >= 12
 
 	SET @StringToExecute += N'SELECT 
 		12 AS CheckId,
-		100 AS [Priority],
+		80 AS [Priority],
 		b.database_name AS [Database Name],
 		''Uncompressed backups'' AS [Finding],
-		''The database '' + QUOTENAME(b.database_name) + '' has had '' + CONVERT(VARCHAR(10), COUNT(*)) + '' uncompressed backups in the last 30 days. This is a free way to save time and space. And SPACETIME. If your version of SQL supports it.'' AS [Warning]
+		''The database '' + QUOTENAME(b.database_name) + '' has had '' + CONVERT(VARCHAR(10), COUNT(*)) + '' uncompressed backups. This is a free way to save time and space. And SPACETIME. If your version of SQL supports it.'' AS [Warning]
 	FROM   ' + QUOTENAME(@MSDBName) + '.dbo.backupset AS b
 	WHERE backup_size = compressed_backup_size AND type = ''D''
-	AND b.backup_finish_date >= DATEADD(DAY, -30, SYSDATETIME())
+	AND b.backup_finish_date >= @StartTime
 	GROUP BY b.database_name;' + @crlf;
 
 	IF @Debug = 1
 		PRINT @StringToExecute;
 
 		INSERT #Warnings ( CheckId, Priority, DatabaseName, Finding, Warning )
-		EXEC sys.sp_executesql @StringToExecute;
+		EXEC sys.sp_executesql @StringToExecute, N'@StartTime DATETIME2', @StartTime;
+
+	/*Looking for backups directed at the NUL device.*/
+	SET @StringToExecute =N'SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;' + @crlf;
+
+	SET @StringToExecute += N'SELECT 
+		14 AS CheckId,
+		20 AS [Priority],
+		bs.database_name AS [Database Name],
+		''Backup to NUL device'' AS [Finding],
+		''The database '' + QUOTENAME(bs.database_name) + '' has had '' + CONVERT(VARCHAR(10), COUNT(*)) + '' backups to the NUL device, the latest one being on ''+
+		CONVERT(NVARCHAR(25),MAX(bs.backup_finish_date),120)+''. These backups do not exist.'' AS [Warning]
+	FROM   ' + QUOTENAME(@MSDBName) + '.dbo.backupset AS bs
+	INNER JOIN ' + QUOTENAME(@MSDBName) + '.dbo.backupmediafamily bmf ON bs.media_set_id = bmf.media_set_id
+	WHERE UPPER(bmf.physical_device_name)= N''NUL''
+	AND (bs.is_copy_only = 1 OR bs.recovery_model = N''SIMPLE'')
+	AND bs.backup_finish_date >= @StartTime
+	GROUP BY bs.database_name' + @crlf;
+	SET @StringToExecute += N'UNION ALL' + @crlf + N'SELECT
+		14 AS CheckId,
+		10 AS [Priority],
+		bs.database_name AS [Database Name],
+		''Backup to NUL device without COPY_ONLY'' AS [Finding],
+		''The database '' + QUOTENAME(bs.database_name) + '' is not in SIMPLE recovery model and has had '' + CONVERT(VARCHAR(10), COUNT(*)) + '' backups to the NUL device, the latest one being on ''+
+		CONVERT(NVARCHAR(25),MAX(bs.backup_finish_date),120)+''. These backups do not exist and they might mess up your current backup chain.'' AS [Warning]
+	FROM   ' + QUOTENAME(@MSDBName) + '.dbo.backupset AS bs
+	INNER JOIN ' + QUOTENAME(@MSDBName) + '.dbo.backupmediafamily bmf ON bs.media_set_id = bmf.media_set_id
+	WHERE UPPER(bmf.physical_device_name)= N''NUL''
+	AND bs.is_copy_only = 0 AND bs.recovery_model <> N''SIMPLE''
+	AND bs.backup_finish_date >= @StartTime
+	GROUP BY bs.database_name' + @crlf;
+
+	IF @Debug = 1
+		PRINT @StringToExecute;
+
+		INSERT #Warnings ( CheckId, Priority, DatabaseName, Finding, Warning )
+		EXEC sys.sp_executesql @StringToExecute, N'@StartTime DATETIME2', @StartTime;
 
 RAISERROR('Rules analysis starting on temp tables', 0, 1) WITH NOWAIT;
 
 		INSERT #Warnings ( CheckId, Priority, DatabaseName, Finding, Warning )
 		SELECT
 			13 AS CheckId,
-			100 AS Priority,
+			50 AS Priority,
 			r.DatabaseName as [DatabaseName],
 			'Big Diffs' AS [Finding],
-			'On average, Differential backups for this database are >=40% of the size of the average Full backup.' AS [Warning]
+			'On average, Differential backups for this database are >=40% of the size of the average Full backup. You might want to consider taking Differential backups more often.' AS [Warning]
 			FROM #Recoverability AS r
 			WHERE r.IsBigDiff = 1
 
 		INSERT #Warnings ( CheckId, Priority, DatabaseName, Finding, Warning )
 		SELECT
 			13 AS CheckId,
-			100 AS Priority,
+			50 AS Priority,
 			r.DatabaseName as [DatabaseName],
 			'Big Logs' AS [Finding],
-			'On average, Log backups for this database are >=20% of the size of the average Full backup.' AS [Warning]
+			'On average, Log backups for this database are >=20% of the size of the average Full backup. You might want to consider taking Log backups more often.' AS [Warning]
 			FROM #Recoverability AS r
 			WHERE r.IsBigLog = 1
 
